@@ -34,6 +34,7 @@
 
 #include <rocRoller/CommandSolution.hpp>
 #include <rocRoller/KernelGraph/CoordinateGraph/Dimension.hpp>
+#include <rocRoller/Expression.hpp>
 #include <rocRoller/Operations/Command.hpp>
 #include <rocRoller/TensorDescriptor.hpp>
 
@@ -42,6 +43,7 @@ using namespace rocRoller;
 const int MAX_BITS_WORKGROUPTILE_M = 8;
 const int MAX_BITS_WORKGROUPTILE_N = 8;
 const int MAX_BITS_WORKGROUPTILE_K = 7;
+const int MAX_BITS_PREFETCH_IN_FLIGHT = 4;
 const int REQUIRED_MULTIPLE_M_N    = 16;
 const int REQUIRED_MULTIPLE_K      = 32;
 
@@ -112,6 +114,7 @@ struct MachineInstructionSize
 struct SolutionIndexParameters
 {
     WorkGroupTileSize workgroupTile;
+    int prefetchInFlight;
 };
 
 /**
@@ -139,11 +142,14 @@ struct SolutionParameters
     // Other options
     bool loadLDSA  = true;
     bool loadLDSB  = true;
-    bool storeLDSD = true;
+    bool storeLDSD = false;
+    bool direct2LDSA = true;
+    bool direct2LDSB = true;
 
     bool prefetch          = true;
     int  prefetchInFlight  = 2;
-    int  prefetchLDSFactor = 2;
+    int  prefetchLDSFactor = 1;
+    bool prefetchMixMemOps = true;
     bool betaInFma         = true;
 
     // Unroll Options
@@ -155,8 +161,16 @@ struct SolutionParameters
     bool streamK        = false;
     bool streamKTwoTile = false;
 
+    // Scale options
     bool loadLDSScaleA = false;
     bool loadLDSScaleB = false;
+    bool swizzleScale = true;
+    bool prefetchScale = true;
+
+    // Workgroup Mapping
+    int workgroupMappingDim = -1;
+    bool workgroupRemapXCC = false;
+    int workgroupMappingSize = -1;
 };
 
 /**
@@ -181,6 +195,8 @@ struct GemmKernel
 
     Operations::OperationTag tagTensorScaleA;
     Operations::OperationTag tagTensorScaleB;
+
+    Operations::OperationTag tagWGM;
 };
 
 /**
@@ -238,6 +254,8 @@ namespace std
             result |= ((params.workgroupTile.n / REQUIRED_MULTIPLE_M_N) << pos);
             pos += MAX_BITS_WORKGROUPTILE_N;
             result |= ((params.workgroupTile.m / REQUIRED_MULTIPLE_M_N) << pos);
+            pos += MAX_BITS_WORKGROUPTILE_M;
+            result |= (params.prefetchInFlight << pos);
 
             AssertFatal(result < INT_MAX, "Solution Index is too large");
             // Set top bit indicating it is a rocRoller index
@@ -268,6 +286,9 @@ SolutionIndexParameters indexToParameters(int index)
     pos += MAX_BITS_WORKGROUPTILE_N;
     result.workgroupTile.m
         = ((index >> pos) & mask(MAX_BITS_WORKGROUPTILE_M)) * REQUIRED_MULTIPLE_M_N;
+    pos += MAX_BITS_WORKGROUPTILE_M;
+    result.prefetchInFlight
+        = (index >> pos) & mask(MAX_BITS_PREFETCH_IN_FLIGHT);
 
     return result;
 }
@@ -466,10 +487,10 @@ KernelType genKernelType(const RocblasltContractionProblem& prob)
 }
 
 const std::vector<WorkGroupTileSize> possibleTileSizes = {
-    {256, 256, 64}, {256, 128, 64}, {128, 256, 64}, {256, 64, 64}, {64, 256, 64},  {128, 128, 64},
-    {256, 32, 64},  {32, 256, 64},  {128, 64, 64},  {64, 128, 64}, {256, 16, 128}, {16, 256, 128},
-    {128, 32, 64},  {32, 128, 64},  {64, 64, 64},   {64, 32, 64},  {32, 64, 64},   {64, 16, 128},
-    {16, 64, 128},  {32, 32, 64},   {32, 16, 128},  {16, 32, 128}, {16, 16, 128}};
+    {256, 256, 128}, {256, 128, 128}, {128, 256, 128}, {256, 64, 128}, {64, 256, 128},  {128, 128, 128},
+    {256, 32, 128},  {32, 256, 128},  {128, 64, 128},  {64, 128, 128}, {256, 16, 128},  {16, 256, 128},
+    {128, 32, 128},  {32, 128, 128},  {64, 64, 128},   {64, 32, 128},  {32, 64, 128},   {64, 16, 128},
+    {16, 64, 128},   {32, 32, 64},    {32, 16, 128},   {16, 32, 128},  {16, 16, 128}};
 
 /**
  * @brief Choose the SolutionIndexParameters to use for a given problem
@@ -491,7 +512,7 @@ std::vector<SolutionIndexParameters> chooseSolutionIndexParameters(
     for(auto const& wgt : possibleTileSizes)
     {
         if((requestedAlgoCount == -1)
-           || (prob.m % wgt.m == 0 && prob.n % wgt.n == 0 && prob.k % (wgt.k * 2) == 0))
+           || (prob.m % wgt.m == 0 && prob.n % wgt.n == 0 && prob.k % wgt.k == 0))
         {
             params.emplace_back(wgt);
 
@@ -500,6 +521,19 @@ std::vector<SolutionIndexParameters> chooseSolutionIndexParameters(
                || kernelType.typeA == rocRoller::DataType::Float)
             {
                 params.back().workgroupTile.k = 32;
+            }
+
+            if(prob.k % (wgt.k * 4) == 0)
+            {
+                params.back().prefetchInFlight = 4;
+            }
+            else if(prob.k % (wgt.k * 2) == 0)
+            {
+                params.back().prefetchInFlight = 2;
+            }
+            else
+            {
+                params.back().prefetchInFlight = 1;
             }
         }
     }
@@ -539,10 +573,10 @@ std::shared_ptr<SolutionParameters>
     }
     else
     {
-        if(gemm->workgroupTile.m % 32 == 0 && gemm->workgroupTile.n % 32 == 0)
-            gemm->machineInstruction = {32, 32, 64, 1};
-        else
+        if(gemm->workgroupTile.k % 128 == 0)
             gemm->machineInstruction = {16, 16, 128, 1};
+        else
+            gemm->machineInstruction = {32, 32, 64, 1};
     }
 
     if(gemm->workgroupTile.m / gemm->machineInstruction.m == 1)
@@ -564,6 +598,15 @@ std::shared_ptr<SolutionParameters>
         gemm->loadLDSScaleA = false;
     if(numScaleElementsB % workgroupSize != 0)
         gemm->loadLDSScaleB = false;
+
+    if(solutionIndexParameters.prefetchInFlight == 1)
+    {
+        gemm->prefetch = false;
+    }
+    else
+    {
+        gemm->prefetchInFlight = solutionIndexParameters.prefetchInFlight;
+    }
 
     return gemm;
 }
@@ -714,7 +757,7 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
                 ShowValue(gemm->kernelType.scaleAMode));
 
     std::optional<Operations::OperationTag> tagTensorScaleA, tagLoadScaleA, tagBlockScaleA,
-        tagTensorScaleB, tagLoadScaleB, tagBlockScaleB;
+        tagTensorScaleB, tagLoadScaleB, tagBlockScaleB, tagWGM;
 
     if(gemm->kernelType.scaleAMode == Operations::ScaleMode::Separate)
     {
@@ -807,6 +850,16 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
                               DataDirection::ReadWrite,
                               rocRoller::SCRATCH);
 
+    if(gemm->workgroupMappingDim != -1)
+    {
+        tagWGM = command->allocateTag();
+        command->allocateArgument(DataType::UInt32,
+                                  *tagWGM,
+                                  ArgumentType::Value,
+                                  DataDirection::ReadOnly,
+                                  rocRoller::WGM);
+    }
+
     // -------------------------------------------------------------
     // Set the parameters
 
@@ -843,6 +896,12 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
     params->setWaveTilesPerWavefront(wavetilePerWavefrontM, wavetilePerWavefrontN);
 
     {
+        auto memoryTypeA = MemoryType::WAVE;
+        if(gemm->direct2LDSA)
+            memoryTypeA = MemoryType::WAVE_Direct2LDS;
+        else if(gemm->loadLDSA)
+            memoryTypeA = MemoryType::LDS;
+
         auto macTileA = KernelGraph::CoordinateGraph::MacroTile(
             {gemm->workgroupTile.m, gemm->workgroupTile.k},
             LayoutType::MATRIX_A,
@@ -850,7 +909,7 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
              gemm->machineInstruction.n,
              gemm->machineInstruction.k,
              gemm->machineInstruction.b},
-            gemm->loadLDSA ? MemoryType::LDS : MemoryType::WAVE);
+             memoryTypeA);
         params->setDimensionInfo(tagLoadA, macTileA);
     }
 
@@ -871,6 +930,12 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
     }
 
     {
+        auto memoryTypeB = MemoryType::WAVE;
+        if(gemm->direct2LDSB)
+            memoryTypeB = MemoryType::WAVE_Direct2LDS;
+        else if(gemm->loadLDSB)
+            memoryTypeB = MemoryType::LDS;
+
         auto macTileB = KernelGraph::CoordinateGraph::MacroTile(
             {gemm->workgroupTile.k, gemm->workgroupTile.n},
             LayoutType::MATRIX_B,
@@ -878,7 +943,7 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
              gemm->machineInstruction.n,
              gemm->machineInstruction.k,
              gemm->machineInstruction.b},
-            gemm->loadLDSB ? MemoryType::LDS : MemoryType::WAVE);
+            memoryTypeB);
         params->setDimensionInfo(tagLoadB, macTileB);
     }
 
@@ -923,6 +988,8 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
 
     params->unrollX = gemm->unrollX;
     params->unrollY = gemm->unrollY;
+    params->swizzleScale  = gemm->swizzleScale;
+    params->prefetchScale = gemm->prefetchScale;
 
     if(gemm->prefetch)
     {
@@ -930,20 +997,7 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
         params->unrollK           = gemm->prefetchInFlight;
         params->prefetchInFlight  = gemm->prefetchInFlight;
         params->prefetchLDSFactor = gemm->prefetchLDSFactor;
-
-        params->prefetchMixMemOps = false;
-
-        if(gemm->prefetchLDSFactor != 0)
-        {
-            params->prefetchMixMemOps = true;
-        }
-
-        if((gemm->kernelType.scaleAMode == Operations::ScaleMode::Separate && !gemm->loadLDSScaleA)
-           || (gemm->kernelType.scaleBMode == Operations::ScaleMode::Separate
-               && !gemm->loadLDSScaleB))
-        {
-            params->prefetchMixMemOps = false;
-        }
+        params->prefetchMixMemOps = gemm->prefetchMixMemOps;
     }
     else
     {
@@ -955,6 +1009,24 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
 
     uint workgroupSizeX = gemm->workgroupSizeX * gemm->workgroupSizeY;
     uint workgroupSizeY = 1;
+
+    // Workgroup Mapping
+    if(gemm->workgroupMappingDim != -1)
+    {
+        auto dim  = gemm->workgroupMappingDim;
+
+        AssertFatal(
+            dim == 0 || dim == 1,
+            "Only 0 (M) or 1 (N) are supported dimensions for workgroup mapping.",
+            ShowValue(dim));
+
+        params->workgroupMapping = {dim, nullptr};
+    }
+
+    if(gemm->workgroupRemapXCC)
+    {
+        params->workgroupRemapXCC = 8;
+    }
 
     params->setManualWorkgroupSize({workgroupSizeX, workgroupSizeY, 1});
     params->setManualWavefrontCount(
@@ -994,6 +1066,9 @@ std::shared_ptr<GemmKernel> genGemmKernel(std::shared_ptr<SolutionParameters> ge
 
     if(tagTensorScaleB)
         gemmKernel->tagTensorScaleB = *tagTensorScaleB;
+
+    if(tagWGM)
+        gemmKernel->tagWGM = *tagWGM;
 
     setPredicates(gemmKernel);
 
@@ -1234,6 +1309,17 @@ CommandArguments createCommandArguments(std::shared_ptr<GemmKernel>        gemm,
     if(gemm->params->kernelType.scaleBMode == Operations::ScaleMode::Separate)
     {
         commandArgs.setArgument(gemm->tagTensorScaleB, ArgumentType::Value, (uint8_t*)prob.scaleB);
+    }
+
+    if(gemm->params->workgroupMappingDim != -1)
+    {
+        auto const size = gemm->params->workgroupMappingSize;
+
+        AssertFatal(size > 0,
+                    "Workgroup mapping size must be a positive non-zero integer.",
+                    ShowValue(size));
+
+        commandArgs.setArgument(gemm->tagWGM, ArgumentType::Value, size);
     }
 
     return commandArgs;
